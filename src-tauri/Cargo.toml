@@ -1,0 +1,27 @@
+[package]
+name = "specpilot"
+version = "0.7.2"
+description = "AI-assisted technical PDF reader"
+authors = ["SpecPilot"]
+edition = "2021"
+
+[lib]
+name = "specpilot_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "system-proxy"] }
+base64 = "0.22"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+regex = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["time"] }
+keyring = { version = "4.1.6", features = ["v1"] }

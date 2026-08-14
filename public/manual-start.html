@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SpecPilot 在线手册</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; color: #dfe6f0; background: radial-gradient(circle at 50% 25%, #182131, transparent 42%), #0c1119; }
+      main { width: min(360px, 86%); text-align: center; }
+      .mark { width: 54px; height: 54px; margin: 0 auto 22px; display: grid; place-items: center; border: 1px solid #ff6b35; color: #ff6b35; transform: rotate(45deg); font: 700 16px Consolas, monospace; }
+      .mark span { transform: rotate(-45deg); }
+      h1 { margin: 0 0 10px; font-size: 19px; }
+      p { margin: 0; color: #7e8a9c; font-size: 12px; line-height: 1.8; }
+      .steps { margin-top: 24px; padding: 16px; border: 1px solid #273244; background: #101721; text-align: left; font: 11px/2 Consolas, monospace; color: #99a5b7; }
+      b { color: #ff8054; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark"><span>SP</span></div>
+      <h1>在线查找芯片手册</h1>
+      <p>在上方输入型号、手册关键词或网页地址。网页将在这个区域直接打开，不再弹出独立窗口。</p>
+      <div class="steps"><b>1.</b> 搜索芯片型号或 datasheet<br><b>2.</b> 浏览搜索结果与厂商网页<br><b>3.</b> 点击 PDF，或选择“导入当前 PDF”</div>
+    </main>
+  </body>
+</html>
