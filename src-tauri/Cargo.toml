@@ -1,6 +1,6 @@
 [package]
 name = "specpilot"
-version = "0.7.2"
+version = "0.7.3"
 description = "AI-assisted technical PDF reader"
 authors = ["SpecPilot"]
 edition = "2021"

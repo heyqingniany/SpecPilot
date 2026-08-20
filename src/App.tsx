@@ -1286,7 +1286,7 @@ export default function App() {
       try { parsed = parseModelObject(answerRaw); }
       catch { parsed = { answer: answerRaw.trim(), source_ids: [], action: "none" }; }
       const answer = parsed.answer?.trim() || `${providerName} 未返回有效回答`;
-      const rawIds = parsed.source_ids == null ? [] : Array.isArray(parsed.source_ids) ? parsed.source_ids : [parsed.source_ids];
+      const rawIds: Array<string | number> = parsed.source_ids == null ? [] : Array.isArray(parsed.source_ids) ? [...parsed.source_ids] : [parsed.source_ids];
       for (const match of answer.matchAll(/\[S(\d+)\]/gi)) rawIds.push(match[1]);
       const sources = [...new Set(rawIds.map((id) => Number(String(id).replace(/\D/g, ""))).filter((id) => id > 0))].map((id) => candidates[id - 1]).filter(Boolean);
       const pageHint = Number(parsed.page) || Number(answer.match(/第\s*(\d+)\s*页/)?.[1]);

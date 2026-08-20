@@ -32,7 +32,7 @@ AI 问答支持 DeepSeek、OpenAI、OpenRouter、硅基流动以及任意 OpenAI
 
 直接运行：
 
-`src-tauri/target/release/bundle/nsis/SpecPilot_0.7.2_x64-setup.exe`
+`src-tauri/target/release/bundle/nsis/SpecPilot_0.7.3_x64-setup.exe`
 
 ## 开发运行
 
