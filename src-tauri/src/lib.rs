@@ -621,7 +621,7 @@ async fn model_chat(request: ModelRequest) -> Result<String, String> {
     let mut payload = serde_json::json!({
         "model": request.model,
         "messages": messages,
-        "max_tokens": 1800
+        "max_tokens": 4096
     });
     if request.json_mode {
         payload["response_format"] = serde_json::json!({ "type": "json_object" });

@@ -1,4 +1,4 @@
-import { FormEvent, RefObject, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, RefObject, forwardRef, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
@@ -84,6 +84,10 @@ const inferPartNumber = (fileName: string, blocks: TextBlock[]) => {
 const formatFileSize = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const MIN_ZOOM = 0.25;
+const MAX_ZOOM = 4;
+const ZOOM_STEP = 0.15;
+type ZoomOrigin = { clientX: number; clientY: number } | "center";
 const tokenize = (value: string) => value.toLowerCase().match(/[a-z0-9][a-z0-9_.-]*|[\u4e00-\u9fff]{2,}/g) ?? [];
 const unionBoxes = (boxes: BoundingBox[]): BoundingBox => {
   const x = Math.min(...boxes.map((box) => box.x));
@@ -207,6 +211,17 @@ async function callModel(apiKey: string, baseUrl: string, model: string, proxyUr
   return invoke<string>("model_chat", { request: { api_key: apiKey, base_url: baseUrl, model, messages, json_mode: jsonMode, proxy_url: proxyUrl } });
 }
 
+function ChatText({ text }: { text: string }) {
+  const chunks = text.split(/(\*\*[^*\n]+?\*\*|`[^`\n]+?`)/g);
+  return <div className="message-body">{chunks.map((chunk, index) => {
+    if (chunk.startsWith("**") && chunk.endsWith("**") && chunk.length > 4) return <strong key={index}>{chunk.slice(2, -2)}</strong>;
+    if (chunk.startsWith("`") && chunk.endsWith("`") && chunk.length > 2) return <code key={index}>{chunk.slice(1, -1)}</code>;
+    return chunk;
+  })}</div>;
+}
+
+const CHAT_SYSTEM = "你是 SpecPilot 的技术助手，面向工程师做手册阅读、原理讲解、设计分析，并能操控左侧 PDF 阅读器。像正常对话一样回答：可以解释、对比、推导、举例、翻译和总结。引用文档时用 [S1] 编号。文档没写清时可用通用工程知识，但必须标明「根据文档」还是「分析推断」，不要编造具体数值、寄存器地址或图号。用中文。只输出 JSON：{\"answer\":\"完整回答\",\"source_ids\":[\"S1\"],\"action\":\"highlight\",\"page\":12}。source_ids 填真正用到的证据编号。用户要求跳转、定位、查看某处，或你引用了文档片段时，action 绝不能是 none：文本用 highlight，图表/布局用 zoom，只有页码用 goto。page 填目标页码。纯闲聊且不涉及文档位置时 action 才用 none。";
+
 async function invokeWithTimeout<T>(command: string, args: Record<string, unknown>, timeoutMs: number, message: string): Promise<T> {
   let timer = 0;
   try {
@@ -219,8 +234,8 @@ async function invokeWithTimeout<T>(command: string, args: Record<string, unknow
   }
 }
 
-const ContinuousPage = memo(function ContinuousPage({ pdfDocument, pageNumber, zoom, rotation, size, highlight, viewerRef }: {
-  pdfDocument: PdfDocument; pageNumber: number; zoom: number; rotation: number; size?: PageSize;
+const ContinuousPage = memo(function ContinuousPage({ pdfDocument, pageNumber, renderZoom, rotation, size, highlight, viewerRef }: {
+  pdfDocument: PdfDocument; pageNumber: number; renderZoom: number; rotation: number; size?: PageSize;
   highlight: BoundingBox | null; viewerRef: RefObject<HTMLDivElement | null>;
 }) {
   const shellRef = useRef<HTMLDivElement>(null);
@@ -270,32 +285,33 @@ const ContinuousPage = memo(function ContinuousPage({ pdfDocument, pageNumber, z
     const canvas = canvasRef.current;
     const textContainer = textRef.current;
     if (!pdfPage || !canvas || !textContainer || !near) return;
-    const viewport = pdfPage.getViewport({ scale: zoom, rotation });
+    const viewport = pdfPage.getViewport({ scale: renderZoom, rotation });
+    const layoutViewport = pdfPage.getViewport({ scale: 1, rotation });
     const ratio = Math.min(window.devicePixelRatio || 1, 1.5);
     const context = canvas.getContext("2d")!;
     canvas.width = Math.floor(viewport.width * ratio);
     canvas.height = Math.floor(viewport.height * ratio);
-    canvas.style.width = `${viewport.width}px`;
-    canvas.style.height = `${viewport.height}px`;
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
     textContainer.replaceChildren();
-    textContainer.style.setProperty("--scale-factor", String(viewport.scale));
+    textContainer.style.setProperty("--scale-factor", "1");
     const renderTask = pdfPage.render({ canvas, canvasContext: context, viewport, transform: ratio === 1 ? undefined : [ratio, 0, 0, ratio, 0, 0] });
     let textLayer: pdfjsLib.TextLayer | undefined;
     let disposed = false;
     void pdfPage.getTextContent().then((textContent) => {
       if (disposed) return;
-      textLayer = new pdfjsLib.TextLayer({ textContentSource: textContent, container: textContainer, viewport });
+      textLayer = new pdfjsLib.TextLayer({ textContentSource: textContent, container: textContainer, viewport: layoutViewport });
       return textLayer.render();
     });
     renderTask.promise.then(() => setReady(true)).catch((error: unknown) => {
       if (!(error instanceof Error) || error.name !== "RenderingCancelledException") console.error(error);
     });
     return () => { disposed = true; renderTask.cancel(); textLayer?.cancel(); };
-  }, [near, zoom, rotation, baseSize]);
+  }, [near, renderZoom, rotation, baseSize]);
 
   const rotated = rotation % 180 !== 0;
-  const width = (rotated ? baseSize.height : baseSize.width) * zoom;
-  const height = (rotated ? baseSize.width : baseSize.height) * zoom;
+  const width = rotated ? baseSize.height : baseSize.width;
+  const height = rotated ? baseSize.width : baseSize.height;
   const shownBox = highlight ? rotateBox(highlight, rotation) : null;
   return <div className="page-wrap" id={`pdf-page-${pageNumber}`} data-page={pageNumber} ref={shellRef}>
     <div className="page-number-chip">{pageNumber}</div>
@@ -306,14 +322,14 @@ const ContinuousPage = memo(function ContinuousPage({ pdfDocument, pageNumber, z
   </div>;
 });
 
-const ContinuousDocument = memo(function ContinuousDocument({ pdfDocument, pages, zoom, rotation, pageSizes, highlight, viewerRef }: {
-  pdfDocument: PdfDocument; pages: number; zoom: number; rotation: number; pageSizes: PageSize[]; highlight: Highlight; viewerRef: RefObject<HTMLDivElement | null>;
-}) {
-  return <div className="continuous-document">{Array.from({ length: pages }, (_, index) => {
+const ContinuousDocument = memo(forwardRef<HTMLDivElement, {
+  pdfDocument: PdfDocument; pages: number; renderZoom: number; rotation: number; pageSizes: PageSize[]; highlight: Highlight; viewerRef: RefObject<HTMLDivElement | null>;
+}>(function ContinuousDocument({ pdfDocument, pages, renderZoom, rotation, pageSizes, highlight, viewerRef }, ref) {
+  return <div className="continuous-document" ref={ref}>{Array.from({ length: pages }, (_, index) => {
     const pageNumber = index + 1;
-    return <ContinuousPage key={pageNumber} pdfDocument={pdfDocument} pageNumber={pageNumber} zoom={zoom} rotation={rotation} size={pageSizes[index]} highlight={highlight?.page === pageNumber ? highlight.bbox : null} viewerRef={viewerRef} />;
+    return <ContinuousPage key={pageNumber} pdfDocument={pdfDocument} pageNumber={pageNumber} renderZoom={renderZoom} rotation={rotation} size={pageSizes[index]} highlight={highlight?.page === pageNumber ? highlight.bbox : null} viewerRef={viewerRef} />;
   })}</div>;
-});
+}));
 
 const Thumbnail = memo(function Thumbnail({ pdfDocument, pageNumber, active, onSelect }: { pdfDocument: PdfDocument; pageNumber: number; active: boolean; onSelect: (page: number) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -359,7 +375,18 @@ export default function App() {
   const [pages, setPages] = useState(0);
   const [pageSizes, setPageSizes] = useState<PageSize[]>([]);
   const [zoom, setZoom] = useState(1.1);
+  const [renderZoom, setRenderZoom] = useState(1.1);
   const [rotation, setRotation] = useState(0);
+  const documentRef = useRef<HTMLDivElement>(null);
+  const zoomSizerRef = useRef<HTMLDivElement>(null);
+  const pendingZoomRef = useRef(1.1);
+  const zoomFrameRef = useRef(0);
+  const offsetXRef = useRef(0);
+  const offsetYRef = useRef(0);
+  const userPlacedRef = useRef(false);
+  const rotateKeepRef = useRef<{ page: number; fracX: number; fracY: number; turn: 90 | 270 } | null>(null);
+  const currentPageRef = useRef(1);
+  const spaceHeldRef = useRef(false);
   const [highlight, setHighlight] = useState<Highlight>(null);
   const [blocks, setBlocks] = useState<TextBlock[]>([]);
   const [searchLines, setSearchLines] = useState<SearchLine[]>([]);
@@ -373,6 +400,7 @@ export default function App() {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [asking, setAsking] = useState(false);
+  const chatBody = useRef<HTMLDivElement>(null);
   const [settings, setSettings] = useState(false);
   const [provider, setProvider] = useState<ProviderId>("deepseek");
   const [apiKeys, setApiKeys] = useState<Partial<Record<ProviderId, string>>>({});
@@ -435,6 +463,16 @@ export default function App() {
   }, []);
 
   useEffect(() => setPageInput(String(page)), [page]);
+  useEffect(() => {
+    const root = chatBody.current;
+    if (root) root.scrollTop = root.scrollHeight;
+  }, [messages, asking]);
+  currentPageRef.current = page;
+  useEffect(() => {
+    if (Math.abs(renderZoom - zoom) < 0.0001) return;
+    const timer = window.setTimeout(() => setRenderZoom(zoom), 140);
+    return () => window.clearTimeout(timer);
+  }, [zoom, renderZoom]);
   useEffect(() => () => { if (objectUrl.current) URL.revokeObjectURL(objectUrl.current); }, []);
   useEffect(() => { void refreshLibrary(); }, [refreshLibrary]);
   useEffect(() => {
@@ -516,6 +554,7 @@ export default function App() {
     suggestionRun.current = "";
     setSuggestedQuestions([]); setSuggestionsLoading(false);
     setPdfDocument(pdf); setFileName(file.name); setPages(pdf.numPages); setPage(1); setRotation(0); setHighlight(null); setMessages([]); setPageSizes([]); setBlocks([]); setSearchLines([]); setFindText(""); setIndexProgress(0);
+    userPlacedRef.current = false;
     setCurrentSourceUrl(options.sourceUrl ?? options.cached?.source_url ?? "");
     setCurrentPartNumber(options.partNumber ?? options.cached?.part_number ?? "");
     setCurrentManufacturer(options.manufacturer ?? options.cached?.manufacturer ?? "");
@@ -644,6 +683,139 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [activeDocumentId, currentManufacturer, currentPartNumber, indexing, messages, suggestedQuestions]);
 
+  const placeSurface = useCallback((zoom: number, offsetX: number, offsetY: number) => {
+    const root = viewer.current;
+    const doc = documentRef.current;
+    const sizer = zoomSizerRef.current;
+    if (!root || !doc || !sizer) return;
+    const scaledW = doc.offsetWidth * zoom;
+    const scaledH = doc.offsetHeight * zoom;
+    const viewW = root.clientWidth;
+    const viewH = root.clientHeight;
+    const nextX = clamp(offsetX, Math.min(0, viewW - scaledW), Math.max(0, viewW - scaledW));
+    const nextY = clamp(offsetY, Math.min(0, viewH - scaledH), Math.max(0, viewH - scaledH));
+    doc.style.transform = `scale(${zoom})`;
+    sizer.style.width = `${Math.max(1, scaledW)}px`;
+    sizer.style.height = `${Math.max(1, scaledH)}px`;
+    sizer.style.marginLeft = `${Math.max(0, nextX)}px`;
+    sizer.style.marginTop = `${Math.max(0, nextY)}px`;
+    root.scrollLeft = Math.max(0, -nextX);
+    root.scrollTop = Math.max(0, -nextY);
+    offsetXRef.current = nextX;
+    offsetYRef.current = nextY;
+  }, []);
+
+  const centerSurface = useCallback((zoom: number) => {
+    const root = viewer.current;
+    const doc = documentRef.current;
+    if (!root || !doc) return;
+    const scaledW = doc.offsetWidth * zoom;
+    const scaledH = doc.offsetHeight * zoom;
+    placeSurface(zoom, Math.max(0, (root.clientWidth - scaledW) / 2), Math.max(0, (root.clientHeight - scaledH) / 2));
+  }, [placeSurface]);
+
+  const relayoutSurface = useCallback(() => {
+    const root = viewer.current;
+    const doc = documentRef.current;
+    if (!root || !doc) return;
+    const z = pendingZoomRef.current;
+    if (userPlacedRef.current) {
+      placeSurface(z, offsetXRef.current, offsetYRef.current);
+      return;
+    }
+    const scaledW = doc.offsetWidth * z;
+    const scaledH = doc.offsetHeight * z;
+    placeSurface(z, Math.max(0, (root.clientWidth - scaledW) / 2), scaledH < root.clientHeight ? Math.max(0, (root.clientHeight - scaledH) / 2) : offsetYRef.current);
+  }, [placeSurface]);
+
+  const setZoomAnchored = useCallback((next: number, origin?: ZoomOrigin | "fit") => {
+    const to = clamp(next, MIN_ZOOM, MAX_ZOOM);
+    const from = pendingZoomRef.current;
+    const root = viewer.current;
+    const sizer = zoomSizerRef.current;
+    if (Math.abs(to - from) < 0.0005 && origin !== "fit") return;
+    pendingZoomRef.current = to;
+    if (origin === "fit" || !origin) {
+      userPlacedRef.current = false;
+      centerSurface(to);
+    } else if (root && sizer && from > 0) {
+      const rect = root.getBoundingClientRect();
+      const clientX = origin === "center" ? rect.left + root.clientWidth / 2 : origin.clientX;
+      const clientY = origin === "center" ? rect.top + root.clientHeight / 2 : origin.clientY;
+      const sizerRect = sizer.getBoundingClientRect();
+      const vx = clientX - rect.left;
+      const vy = clientY - rect.top;
+      const factor = to / from;
+      userPlacedRef.current = true;
+      placeSurface(to, vx - (vx - (sizerRect.left - rect.left)) * factor, vy - (vy - (sizerRect.top - rect.top)) * factor);
+    } else {
+      centerSurface(to);
+    }
+    if (!zoomFrameRef.current) {
+      zoomFrameRef.current = requestAnimationFrame(() => {
+        zoomFrameRef.current = 0;
+        setZoom(pendingZoomRef.current);
+      });
+    }
+  }, [centerSurface, placeSurface]);
+
+  const rotateBy = useCallback((turn: 90 | 270) => {
+    const root = viewer.current;
+    const pageEl = window.document.getElementById(`pdf-page-${currentPageRef.current}`);
+    let fracX = 0.5;
+    let fracY = 0.5;
+    if (root && pageEl) {
+      const rootRect = root.getBoundingClientRect();
+      const pageRect = pageEl.getBoundingClientRect();
+      if (pageRect.width && pageRect.height) {
+        fracX = (rootRect.left + root.clientWidth / 2 - pageRect.left) / pageRect.width;
+        fracY = (rootRect.top + root.clientHeight / 2 - pageRect.top) / pageRect.height;
+      }
+    }
+    rotateKeepRef.current = { page: currentPageRef.current, fracX, fracY, turn };
+    setRotation((value) => (value + turn) % 360);
+  }, []);
+
+  useLayoutEffect(() => {
+    const keep = rotateKeepRef.current;
+    rotateKeepRef.current = null;
+    if (!keep) {
+      relayoutSurface();
+      return;
+    }
+    const root = viewer.current;
+    const doc = documentRef.current;
+    const sizer = zoomSizerRef.current;
+    const z = pendingZoomRef.current;
+    if (!root || !doc || !sizer) {
+      relayoutSurface();
+      return;
+    }
+    sizer.style.width = `${Math.max(1, doc.offsetWidth * z)}px`;
+    sizer.style.height = `${Math.max(1, doc.offsetHeight * z)}px`;
+    doc.style.transform = `scale(${z})`;
+    const fracX = keep.turn === 90 ? 1 - keep.fracY : keep.fracY;
+    const fracY = keep.turn === 90 ? keep.fracX : 1 - keep.fracX;
+    const element = window.document.getElementById(`pdf-page-${keep.page}`);
+    if (!element) {
+      relayoutSurface();
+      return;
+    }
+    const rootRect = root.getBoundingClientRect();
+    const pageRect = element.getBoundingClientRect();
+    const sizerRect = sizer.getBoundingClientRect();
+    userPlacedRef.current = true;
+    placeSurface(
+      z,
+      sizerRect.left - rootRect.left + (rootRect.left + root.clientWidth / 2 - fracX * pageRect.width) - pageRect.left,
+      sizerRect.top - rootRect.top + (rootRect.top + root.clientHeight / 2 - fracY * pageRect.height) - pageRect.top,
+    );
+  }, [pageSizes, pages, rotation, pdfDocument, relayoutSurface, placeSurface]);
+
+  useEffect(() => () => {
+    if (zoomFrameRef.current) cancelAnimationFrame(zoomFrameRef.current);
+  }, []);
+
   const scrollToPage = useCallback((requested: number, behavior: ScrollBehavior = "smooth") => {
     const target = clamp(Math.round(requested || 1), 1, pages || 1);
     setPage(target);
@@ -666,40 +838,109 @@ export default function App() {
     const top = root.scrollTop + highlightRect.top - rootRect.top - (root.clientHeight - highlightRect.height) / 2;
     root.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
   }, 180), []);
+  const fitWidth = useCallback(() => {
+    const size = pageSizes[page - 1];
+    const root = viewer.current;
+    if (!size || !root) return;
+    const width = rotation % 180 ? size.height : size.width;
+    setZoomAnchored((root.clientWidth - 48) / width, "fit");
+  }, [page, pageSizes, rotation, setZoomAnchored]);
+  const fitPage = useCallback(() => {
+    const size = pageSizes[page - 1];
+    const root = viewer.current;
+    if (!size || !root) return;
+    const width = rotation % 180 ? size.height : size.width;
+    const height = rotation % 180 ? size.width : size.height;
+    setZoomAnchored(Math.min((root.clientWidth - 48) / width, (root.clientHeight - 48) / height), "fit");
+  }, [page, pageSizes, rotation, setZoomAnchored]);
   const controller: ViewerController = useMemo(() => ({
     gotoPage(target) { scrollToPage(target); },
-    setZoom(scale) { setZoom(clamp(scale, 0.5, 3)); },
+    setZoom(scale) { setZoomAnchored(scale, "center"); },
     highlightRegion(target, bbox) { setHighlight({ page: target, bbox }); scrollToPage(target); focusHighlight(target); },
     zoomToRegion(target, bbox) {
       const root = viewer.current; const size = pageSizes[target - 1];
-      if (root && size) setZoom(clamp(Math.min((root.clientWidth - 110) / (size.width * Math.max(bbox.width, 0.18)), (root.clientHeight - 110) / (size.height * Math.max(bbox.height, 0.12))), 0.5, 3));
+      if (root && size) setZoomAnchored(Math.min((root.clientWidth - 110) / (size.width * Math.max(bbox.width, 0.18)), (root.clientHeight - 110) / (size.height * Math.max(bbox.height, 0.12))));
       setHighlight({ page: target, bbox }); scrollToPage(target); focusHighlight(target);
     },
     clearHighlights() { setHighlight(null); },
-  }), [focusHighlight, pageSizes, scrollToPage]);
+  }), [focusHighlight, pageSizes, scrollToPage, setZoomAnchored]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, [contenteditable='true']")) return;
-      if (event.key === "PageDown" || event.key === "ArrowRight") { event.preventDefault(); scrollToPage(page + 1); }
-      if (event.key === "PageUp" || event.key === "ArrowLeft") { event.preventDefault(); scrollToPage(page - 1); }
+      const root = viewer.current;
+      const mod = event.ctrlKey || event.metaKey;
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (!event.repeat) {
+          spaceHeldRef.current = true;
+          root?.classList.add("pre-pan");
+        }
+        return;
+      }
+      if (event.key === "PageDown") { event.preventDefault(); root?.scrollBy({ top: Math.max(120, root.clientHeight - 48) }); return; }
+      if (event.key === "PageUp") { event.preventDefault(); root?.scrollBy({ top: -Math.max(120, root.clientHeight - 48) }); return; }
+      if (event.key === "ArrowDown") { event.preventDefault(); root?.scrollBy({ top: 72 }); return; }
+      if (event.key === "ArrowUp") { event.preventDefault(); root?.scrollBy({ top: -72 }); return; }
+      if (event.key === "ArrowRight") { event.preventDefault(); scrollToPage(page + 1); }
+      if (event.key === "ArrowLeft") { event.preventDefault(); scrollToPage(page - 1); }
       if (event.key === "Home") { event.preventDefault(); scrollToPage(1); }
       if (event.key === "End") { event.preventDefault(); scrollToPage(pages); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") { event.preventDefault(); setSidebar(true); setSideMode("search"); }
-      if ((event.ctrlKey || event.metaKey) && ["+", "="].includes(event.key)) { event.preventDefault(); setZoom((value) => clamp(value + 0.15, 0.5, 3)); }
-      if ((event.ctrlKey || event.metaKey) && event.key === "-") { event.preventDefault(); setZoom((value) => clamp(value - 0.15, 0.5, 3)); }
+      if (mod && event.key.toLowerCase() === "f") { event.preventDefault(); setSidebar(true); setSideMode("search"); }
+      if (mod && ["+", "=", "Add"].includes(event.key)) { event.preventDefault(); setZoomAnchored(pendingZoomRef.current + ZOOM_STEP, "center"); }
+      if (mod && (event.key === "-" || event.key === "Subtract")) { event.preventDefault(); setZoomAnchored(pendingZoomRef.current - ZOOM_STEP, "center"); }
+      if (mod && event.key === "0") { event.preventDefault(); fitPage(); }
+      if (mod && event.key === "1") { event.preventDefault(); setZoomAnchored(1, "center"); }
+      if (mod && event.key === "2") { event.preventDefault(); fitWidth(); }
     };
-    window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey);
-  }, [page, pages, scrollToPage]);
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.code !== "Space") return;
+      spaceHeldRef.current = false;
+      viewer.current?.classList.remove("pre-pan");
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+      spaceHeldRef.current = false;
+      viewer.current?.classList.remove("pre-pan");
+    };
+  }, [fitPage, fitWidth, page, pages, scrollToPage, setZoomAnchored]);
+
+  useEffect(() => {
+    const onWheelCapture = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      const root = viewer.current;
+      if (!root || !pdfDocument || !root.contains(event.target as Node)) return;
+      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 32 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? 120 : 1;
+      const delta = (event.deltaY !== 0 ? event.deltaY : event.deltaX) * unit;
+      if (delta === 0) return;
+      setZoomAnchored(pendingZoomRef.current * Math.exp(-delta * 0.0018), { clientX: event.clientX, clientY: event.clientY });
+    };
+    window.addEventListener("wheel", onWheelCapture, { passive: false, capture: true });
+    return () => window.removeEventListener("wheel", onWheelCapture, true);
+  }, [pdfDocument, setZoomAnchored]);
 
   useEffect(() => {
     const root = viewer.current;
     if (!root || !pdfDocument) return;
     let animationFrame = 0;
+    let pan: { pointerId: number; x: number; y: number; ox: number; oy: number } | null = null;
+    const captureOffset = () => {
+      const sizer = zoomSizerRef.current;
+      if (!sizer) return;
+      const rootRect = root.getBoundingClientRect();
+      const sizerRect = sizer.getBoundingClientRect();
+      offsetXRef.current = sizerRect.left - rootRect.left;
+      offsetYRef.current = sizerRect.top - rootRect.top;
+    };
     const updateCurrentPage = () => {
       cancelAnimationFrame(animationFrame);
       animationFrame = requestAnimationFrame(() => {
+        captureOffset();
         const rootRect = root.getBoundingClientRect();
         const readingLine = rootRect.top + Math.min(90, root.clientHeight * 0.18);
         const readingX = rootRect.left + root.clientWidth / 2;
@@ -708,23 +949,59 @@ export default function App() {
       });
     };
     const onWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 28 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? root.clientHeight : 1;
       if (event.ctrlKey || event.metaKey) {
-        setZoom((value) => clamp(value + (event.deltaY < 0 ? 0.08 : -0.08), 0.5, 3));
+        event.preventDefault();
         return;
       }
+      event.preventDefault();
+      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 28 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? root.clientHeight : 1;
       root.scrollBy({ left: event.deltaX * unit, top: event.deltaY * unit, behavior: "auto" });
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button !== 1 && !spaceHeldRef.current) return;
+      event.preventDefault();
+      captureOffset();
+      pan = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, ox: offsetXRef.current, oy: offsetYRef.current };
+      root.setPointerCapture(event.pointerId);
+      root.classList.add("panning");
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (!pan || event.pointerId !== pan.pointerId) return;
+      userPlacedRef.current = true;
+      placeSurface(pendingZoomRef.current, pan.ox + (event.clientX - pan.x), pan.oy + (event.clientY - pan.y));
+    };
+    const endPan = (event: PointerEvent) => {
+      if (!pan || event.pointerId !== pan.pointerId) return;
+      pan = null;
+      root.classList.remove("panning");
+      if (root.hasPointerCapture(event.pointerId)) root.releasePointerCapture(event.pointerId);
+    };
+    const onAuxClick = (event: MouseEvent) => {
+      if (event.button === 1) event.preventDefault();
     };
     root.addEventListener("wheel", onWheel, { passive: false });
     root.addEventListener("scroll", updateCurrentPage, { passive: true });
+    root.addEventListener("pointerdown", onPointerDown);
+    root.addEventListener("pointermove", onPointerMove);
+    root.addEventListener("pointerup", endPan);
+    root.addEventListener("pointercancel", endPan);
+    root.addEventListener("auxclick", onAuxClick);
+    const resizeObserver = new ResizeObserver(() => { relayoutSurface(); });
+    resizeObserver.observe(root);
     updateCurrentPage();
     return () => {
       cancelAnimationFrame(animationFrame);
+      resizeObserver.disconnect();
       root.removeEventListener("wheel", onWheel);
       root.removeEventListener("scroll", updateCurrentPage);
+      root.removeEventListener("pointerdown", onPointerDown);
+      root.removeEventListener("pointermove", onPointerMove);
+      root.removeEventListener("pointerup", endPan);
+      root.removeEventListener("pointercancel", endPan);
+      root.removeEventListener("auxclick", onAuxClick);
+      root.classList.remove("panning");
     };
-  }, [pdfDocument]);
+  }, [pdfDocument, placeSurface, relayoutSurface]);
 
   const findResults = useMemo(() => findDocument(searchLines, findText), [findText, searchLines]);
   const activateFindResult = useCallback((requested: number) => {
@@ -739,8 +1016,6 @@ export default function App() {
     if (findText.trim() && findResults[0]) controller.highlightRegion(findResults[0].page, findResults[0].bbox);
     else if (!findText.trim()) controller.clearHighlights();
   }, [findResults, findText]);
-  const fitWidth = () => { const size = pageSizes[page - 1]; if (size && viewer.current) controller.setZoom((viewer.current.clientWidth - 76) / (rotation % 180 ? size.height : size.width)); };
-  const fitPage = () => { const size = pageSizes[page - 1]; if (size && viewer.current) { const width = rotation % 180 ? size.height : size.width; const height = rotation % 180 ? size.width : size.height; controller.setZoom(Math.min((viewer.current.clientWidth - 76) / width, (viewer.current.clientHeight - 76) / height)); } };
   const saveCopy = () => { if (!objectUrl.current) return; const link = window.document.createElement("a"); link.href = objectUrl.current; link.download = fileName; link.click(); };
 
   const openPdfUrl = useCallback(async (requestedUrl: string, metadata: { partNumber?: string; manufacturer?: string } = {}) => {
@@ -973,32 +1248,58 @@ export default function App() {
   const ask = async (event: FormEvent) => {
     event.preventDefault();
     const text = question.trim();
-    if (!text || !pdfDocument || indexing || asking) return;
+    if (!text || asking) return;
     if (!apiKey.trim()) { openSettings(); return; }
+    const history = messages.filter((message) => !message.error).slice(-8);
     setMessages((current) => [...current, { role: "user", text }]); setQuestion(""); setAsking(true);
     try {
-      const planRaw = await callModel(apiKey, baseUrl, model, proxyUrl, [
-        { role: "system", content: "你是技术文档检索规划器。把用户问题转换成适合在英文/中文 datasheet 中检索的 2-5 个精确关键词或短语。只输出 JSON：{\"queries\":[\"...\"]}。不要回答问题。" },
-        { role: "user", content: text },
-      ]);
-      let queries = [text];
-      try { const parsed = parseModelObject<{ queries?: string[] }>(planRaw); if (parsed.queries?.length) queries = [text, ...parsed.queries]; } catch { /* use original */ }
+      const wantsLocate = /(跳转|定位|找到|翻到|打开第|去第|看一下|在哪|哪一页|指给|标出|高亮|放大|zoom|goto)/i.test(text);
+      const queries = [text];
+      const lastUser = [...history].reverse().find((message) => message.role === "user")?.text;
+      const looksLikeFollowUp = !wantsLocate && history.length > 0 && (text.length < 36 || /^(那|这个|这些|为什么|怎么|如何|解释|详细|继续|再|不是|对的|简单|举例|对比|分析)/.test(text));
+      if (lastUser && (looksLikeFollowUp || wantsLocate)) queries.push(lastUser);
+      if (pdfDocument && blocks.length && !looksLikeFollowUp) {
+        try {
+          const planRaw = await callModel(apiKey, baseUrl, model, proxyUrl, [
+            { role: "system", content: "你是技术文档检索规划器。把用户问题转换成适合在英文/中文 datasheet 中检索的 2-5 个精确关键词或短语。只输出 JSON：{\"queries\":[\"...\"]}。不要回答问题。" },
+            { role: "user", content: text },
+          ]);
+          const parsedPlan = parseModelObject<{ queries?: string[] }>(planRaw);
+          if (parsedPlan.queries?.length) queries.push(...parsedPlan.queries);
+        } catch { /* 检索词失败时仍用原问题继续对话 */ }
+      }
       await yieldToBrowser();
-      const candidates = searchDocument(blocks, queries, 12);
-      if (!candidates.length) throw new Error("没有检索到可交给模型的文档证据，请换用更精确的术语");
-      const evidence = candidates.map((source, index) => `[S${index + 1}] Page ${source.page}\n${source.text}`).join("\n\n");
-      const answerRaw = await callModel(apiKey, baseUrl, model, proxyUrl, [
-        { role: "system", content: "你是工程技术文档助手。只能根据证据回答，不得补充证据之外的参数。输出 JSON：{\"answer\":\"中文回答\",\"source_ids\":[\"S1\"],\"action\":\"highlight\"}。source_ids 只选真正支持回答的证据；action 只能是 none、goto、highlight、zoom。图表/时序图适合 zoom，文本参数适合 highlight。" },
-        { role: "user", content: `问题：${text}\n\n证据：\n${evidence}` },
-      ]);
-      const parsed = JSON.parse(answerRaw) as { answer?: string; source_ids?: string[]; action?: "none" | "goto" | "highlight" | "zoom" };
-      const sources = (parsed.source_ids ?? []).map((id) => candidates[Number(id.replace(/\D/g, "")) - 1]).filter(Boolean);
+      const candidates = pdfDocument && blocks.length ? searchDocument(blocks, queries, 16) : [];
+      const overview = blocks.slice(0, 8).map((block) => block.text).join(" ").replace(/\s+/g, " ").slice(0, 1400);
+      const evidence = candidates.length
+        ? candidates.map((source, index) => `[S${index + 1}] Page ${source.page}\n${source.text}`).join("\n\n")
+        : overview
+          ? `未检索到更精确的片段。文档开头摘要：\n${overview}`
+          : "当前没有可用的 PDF 文本索引。";
+      const chatMessages: ModelMessage[] = [
+        { role: "system", content: CHAT_SYSTEM },
+        ...history.map((message) => ({ role: message.role, content: message.text.slice(0, 1800) })),
+        { role: "user", content: `文档：${pdfDocument ? fileName : "未打开"}${currentPartNumber ? `（${currentPartNumber}）` : ""}${currentManufacturer ? ` / ${currentManufacturer}` : ""}${pdfDocument ? `\n当前阅读页：${page}` : ""}\n\n用户问题：${text}\n\n相关文档内容：\n${evidence}\n\n若问题涉及跳转、定位或查看某处，必须填写 source_ids、page，并把 action 设为 highlight、zoom 或 goto。` },
+      ];
+      const answerRaw = await callModel(apiKey, baseUrl, model, proxyUrl, chatMessages);
+      let parsed: { answer?: string; source_ids?: string[] | string | number[]; action?: "none" | "goto" | "highlight" | "zoom"; page?: number | string };
+      try { parsed = parseModelObject(answerRaw); }
+      catch { parsed = { answer: answerRaw.trim(), source_ids: [], action: "none" }; }
       const answer = parsed.answer?.trim() || `${providerName} 未返回有效回答`;
-      setMessages((current) => [...current, { role: "assistant", text: answer, sources }]);
-      const first = sources[0];
-      if (first && parsed.action === "zoom") controller.zoomToRegion(first.page, first.bbox);
-      else if (first && parsed.action === "goto") controller.gotoPage(first.page);
-      else if (first && parsed.action !== "none") controller.highlightRegion(first.page, first.bbox);
+      const rawIds = parsed.source_ids == null ? [] : Array.isArray(parsed.source_ids) ? parsed.source_ids : [parsed.source_ids];
+      for (const match of answer.matchAll(/\[S(\d+)\]/gi)) rawIds.push(match[1]);
+      const sources = [...new Set(rawIds.map((id) => Number(String(id).replace(/\D/g, ""))).filter((id) => id > 0))].map((id) => candidates[id - 1]).filter(Boolean);
+      const pageHint = Number(parsed.page) || Number(answer.match(/第\s*(\d+)\s*页/)?.[1]);
+      const target = sources[0] ?? (Number.isFinite(pageHint) && pageHint >= 1 ? candidates.find((item) => item.page === pageHint) : undefined);
+      setMessages((current) => [...current, { role: "assistant", text: answer, sources: sources.length ? sources : undefined }]);
+      const action = parsed.action === "zoom" || parsed.action === "goto" || parsed.action === "highlight"
+        ? parsed.action
+        : wantsLocate || sources.length ? (/图|时序|layout|figure/i.test(`${text}\n${answer}`) ? "zoom" : "highlight") : "none";
+      if (action === "zoom" && target) controller.zoomToRegion(target.page, target.bbox);
+      else if (action === "goto" && (target || pageHint)) controller.gotoPage(target?.page ?? pageHint);
+      else if (action !== "none" && target) controller.highlightRegion(target.page, target.bbox);
+      else if (action !== "none" && pageHint) controller.gotoPage(pageHint);
+      else if (wantsLocate && candidates[0]) controller.highlightRegion(candidates[0].page, candidates[0].bbox);
     } catch (error) {
       setMessages((current) => [...current, { role: "assistant", text: error instanceof Error ? error.message : String(error), error: true }]);
     } finally { setAsking(false); }
@@ -1016,17 +1317,17 @@ export default function App() {
         <div className="viewer-toolbar">
           <div className="tool-group"><button title="侧栏" onClick={() => setSidebar((value) => !value)}>☰</button><button title="查找 (Ctrl+F)" disabled={!pdfDocument} onClick={() => { setSidebar(true); setSideMode("search"); }}>⌕</button></div>
           <div className="tool-group"><button title="上一页" disabled={!pdfDocument || page <= 1} onClick={() => scrollToPage(page - 1)}>←</button><label><input value={pageInput} disabled={!pdfDocument} onChange={(event) => setPageInput(event.target.value.replace(/\D/g, ""))} onBlur={() => scrollToPage(Number(pageInput))} onKeyDown={(event) => event.key === "Enter" && scrollToPage(Number(pageInput))} /><span>/ {pages || "—"}</span></label><button title="下一页" disabled={!pdfDocument || page >= pages} onClick={() => scrollToPage(page + 1)}>→</button></div>
-          <div className="tool-group"><button title="缩小" disabled={!pdfDocument} onClick={() => controller.setZoom(zoom - 0.15)}>−</button><span className="zoom-value">{Math.round(zoom * 100)}%</span><button title="放大" disabled={!pdfDocument} onClick={() => controller.setZoom(zoom + 0.15)}>＋</button></div>
-          <div className="tool-group"><button disabled={!pdfDocument} onClick={fitWidth}>适合宽度</button><button disabled={!pdfDocument} onClick={fitPage}>适合页面</button></div>
-          <div className="tool-group"><button title="逆时针旋转" disabled={!pdfDocument} onClick={() => setRotation((value) => (value + 270) % 360)}>↶</button><button title="顺时针旋转" disabled={!pdfDocument} onClick={() => setRotation((value) => (value + 90) % 360)}>↷</button><button title="另存副本" disabled={!pdfDocument} onClick={saveCopy}>⇩</button><button title="打印" disabled={!pdfDocument} onClick={() => window.print()}>⎙</button><button title="全屏" onClick={() => void (window.document.fullscreenElement ? window.document.exitFullscreen() : window.document.documentElement.requestFullscreen())}>⛶</button></div>
+          <div className="tool-group"><button title="缩小 (Ctrl+-)" disabled={!pdfDocument} onClick={() => setZoomAnchored(zoom - ZOOM_STEP, "center")}>−</button><button className="zoom-value" title="实际大小 (Ctrl+1)" disabled={!pdfDocument} onClick={() => setZoomAnchored(1, "center")}>{Math.round(zoom * 100)}%</button><button title="放大 (Ctrl++)" disabled={!pdfDocument} onClick={() => setZoomAnchored(zoom + ZOOM_STEP, "center")}>＋</button></div>
+          <div className="tool-group"><button title="适合宽度 (Ctrl+2)" disabled={!pdfDocument} onClick={fitWidth}>适合宽度</button><button title="适合页面 (Ctrl+0)" disabled={!pdfDocument} onClick={fitPage}>适合页面</button></div>
+          <div className="tool-group"><button title="逆时针旋转" disabled={!pdfDocument} onClick={() => rotateBy(270)}>↶</button><button title="顺时针旋转" disabled={!pdfDocument} onClick={() => rotateBy(90)}>↷</button><button title="另存副本" disabled={!pdfDocument} onClick={saveCopy}>⇩</button><button title="打印" disabled={!pdfDocument} onClick={() => window.print()}>⎙</button><button title="全屏" onClick={() => void (window.document.fullscreenElement ? window.document.exitFullscreen() : window.document.documentElement.requestFullscreen())}>⛶</button></div>
         </div>
         <div className="reader-body">
           {sidebar && <aside className="pdf-sidebar"><div className="side-tabs"><button className={sideMode === "thumbnails" ? "active" : ""} onClick={() => setSideMode("thumbnails")}>缩略图</button><button className={sideMode === "search" ? "active" : ""} onClick={() => setSideMode("search")}>查找</button></div>{sideMode === "thumbnails" ? pdfDocument && <ThumbnailList pdfDocument={pdfDocument} pages={pages} activePage={page} onSelect={scrollToPage} /> : <div className="find-panel"><input autoFocus value={findText} onChange={(event) => setFindText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); activateFindResult(findIndex + (event.shiftKey ? -1 : 1)); } }} placeholder="在文档中查找…" /><div className="find-summary"><small>{findText ? findResults.length ? `${findIndex + 1} / ${findResults.length}` : "未找到" : "输入关键词"}</small><span><button disabled={!findResults.length} title="上一个结果" onClick={() => activateFindResult(findIndex - 1)}>↑</button><button disabled={!findResults.length} title="下一个结果" onClick={() => activateFindResult(findIndex + 1)}>↓</button></span></div><div className="find-list">{findResults.map((result, index) => <button className={index === findIndex ? "active" : ""} key={`${result.page}-${index}`} onClick={() => activateFindResult(index)}><b>第 {result.page} 页</b><span>{result.text}</span></button>)}</div></div>}</aside>}
           <div className={`viewer ${pdfDocument ? "" : "viewer-empty"}`} ref={viewer} tabIndex={0} aria-label="PDF 连续阅读区">
-            {pdfDocument ? <ContinuousDocument pdfDocument={pdfDocument} pages={pages} zoom={zoom} rotation={rotation} pageSizes={pageSizes} highlight={highlight} viewerRef={viewer} /> : <div className={`empty-state ${dragging ? "dragging" : ""}`} onClick={() => fileInput.current?.click()}><div className="document-icon"><span>PDF</span></div><h1>打开技术文档</h1><p>拖放 PDF 或从本地选择。支持连续阅读、搜索、复制文本、打印以及 AI 证据定位。</p><button className="secondary">选择 PDF 文件</button><div className="features"><span>✓ 完整阅读</span><span>✓ 本地解析</span><span>✓ AI 可追溯</span></div></div>}
+            {pdfDocument ? <div className="zoom-sizer" ref={zoomSizerRef}><ContinuousDocument ref={documentRef} pdfDocument={pdfDocument} pages={pages} renderZoom={renderZoom} rotation={rotation} pageSizes={pageSizes} highlight={highlight} viewerRef={viewer} /></div> : <div className={`empty-state ${dragging ? "dragging" : ""}`} onClick={() => fileInput.current?.click()}><div className="document-icon"><span>PDF</span></div><h1>打开技术文档</h1><p>拖放 PDF 或从本地选择。支持连续阅读、搜索、复制文本、打印以及 AI 证据定位。</p><button className="secondary">选择 PDF 文件</button><div className="features"><span>✓ 完整阅读</span><span>✓ 本地解析</span><span>✓ AI 可追溯</span></div></div>}
           </div>
         </div>
-        <div className="statusbar"><span>{pdfDocument ? `第 ${page} 页，共 ${pages} 页 · 旋转 ${rotation}°` : "等待文档"}</span><span>{indexing ? `正在建立索引 ${indexProgress}%` : pdfDocument ? `${blocks.length.toLocaleString()} 个段落已索引` : "PDF.js 引擎就绪"}</span><span>{activeDocumentId ? `✓ 文档库已保存${librarySavedAt ? ` · ${librarySavedAt}` : ""}` : "滚轮浏览 · Ctrl+滚轮缩放 · Ctrl+F 查找"}</span></div>
+        <div className="statusbar"><span>{pdfDocument ? `第 ${page} 页，共 ${pages} 页 · ${Math.round(zoom * 100)}% · 旋转 ${rotation}°` : "等待文档"}</span><span>{indexing ? `正在建立索引 ${indexProgress}%` : pdfDocument ? `${blocks.length.toLocaleString()} 个段落已索引` : "PDF.js 引擎就绪"}</span><span>{activeDocumentId ? `✓ 文档库已保存${librarySavedAt ? ` · ${librarySavedAt}` : ""}` : "滚轮浏览 · Ctrl+滚轮缩放 · 空格拖动 · Ctrl+F 查找"}</span></div>
       </section>
       <aside className="chat-panel">
         <div className="right-tabs" role="tablist" aria-label="右侧工具">
@@ -1036,17 +1337,17 @@ export default function App() {
         </div>
         {rightMode === "assistant" ? <>
           <div className="chat-title"><div><span className="spark">✦</span><strong>AI 文档助手</strong></div><span className={apiKey ? "local-badge ready" : "local-badge"}>{apiKey ? `${providerName} · ${model}` : "未配置"}</span></div>
-          <div className="chat-body">
+          <div className="chat-body" ref={chatBody}>
             {!messages.length ? <div className="chat-empty">
-              <div className="orb">✦</div><h2>{pdfDocument ? "你可能想了解" : "先检索，再让 AI 回答"}</h2>
-              <p>{!pdfDocument ? "先打开 PDF，再配置任一兼容模型。" : suggestionsLoading ? `${providerName} 正在结合文档内容生成推荐问题…` : apiKey ? "这些问题根据当前 PDF 的标题、关键段落和技术术语生成。" : "当前显示本地生成的问题；配置模型后会自动生成更具体的推荐。"}</p>
+              <div className="orb">✦</div><h2>{pdfDocument ? "问我任何关于这份文档的问题" : "先打开文档，或直接开始对话"}</h2>
+              <p>{!pdfDocument ? "打开 PDF 后可以结合原文解释、分析和定位。配置模型后也可以先普通对话。" : suggestionsLoading ? `${providerName} 正在结合文档内容生成推荐问题…` : apiKey ? "可以追问原理、对比方案、解释参数，需要时我会定位到文档依据。" : "当前显示本地生成的问题；配置模型后可进行完整对话分析。"}</p>
               <div className="suggestions">
                 {indexing && !suggestedQuestions.length ? <button disabled>正在分析文档结构…<span>⋯</span></button> : suggestedQuestions.map((item) => <button key={item} disabled={!pdfDocument} onClick={() => setQuestion(item)}>{item}<span>↗</span></button>)}
               </div>
-            </div> : messages.map((message, index) => <div className={`message ${message.role} ${message.error ? "error" : ""}`} key={index}><span className="message-label">{message.role === "user" ? "你" : providerName.toUpperCase()}</span><p>{message.text}</p>{message.sources?.map((source, sourceIndex) => <button className="source" key={sourceIndex} onClick={() => controller.highlightRegion(source.page, source.bbox)}><span>第 {source.page} 页</span><em>{source.text}</em><b>定位 ↗</b></button>)}</div>)}
-            {asking && <div className="thinking"><span /><span /><span /> {providerName} 正在分析证据</div>}
+            </div> : messages.map((message, index) => <div className={`message ${message.role} ${message.error ? "error" : ""}`} key={index}><span className="message-label">{message.role === "user" ? "你" : providerName.toUpperCase()}</span>{message.error ? <p>{message.text}</p> : <ChatText text={message.text} />}{message.sources?.map((source, sourceIndex) => <button className="source" key={sourceIndex} onClick={() => controller.highlightRegion(source.page, source.bbox)}><span>第 {source.page} 页</span><em>{source.text}</em><b>定位 ↗</b></button>)}</div>)}
+            {asking && <div className="thinking"><span /><span /><span /> {providerName} 正在思考</div>}
           </div>
-          <form className="composer" onSubmit={(event) => void ask(event)}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!pdfDocument || asking} placeholder={pdfDocument ? "询问参数、寄存器或图表位置…" : "请先打开一份 PDF"} /><div><span>{indexing ? `索引中 ${indexProgress}%` : apiKey ? `${providerName} 已配置 · Enter 发送` : "需要配置模型"}</span><button disabled={!pdfDocument || indexing || asking || !question.trim()}>↑</button></div></form>
+          <form className="composer" onSubmit={(event) => void ask(event)}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={asking} placeholder={pdfDocument ? "提问、解释、分析，或让我定位文档中的依据…" : "配置模型后可直接对话；打开 PDF 后能结合原文分析"} /><div><span>{indexing ? `索引中 ${indexProgress}% · 仍可提问` : apiKey ? `${providerName} 已配置 · Enter 发送` : "需要配置模型"}</span><button disabled={asking || !question.trim()}>↑</button></div></form>
         </> : rightMode === "finder" ? <section className="finder-panel">
           <div className="tool-panel-head">
             <div><span className="spark">⌁</span><strong>智能找手册</strong></div>
