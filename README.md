@@ -1,6 +1,8 @@
-# SpecPilot MVP
+# SpecPilot
 
-面向工程师的本地优先 AI 技术文档桌面阅读器原型，使用 Tauri + React + PDF.js。
+面向工程师的本地优先 AI 技术文档桌面阅读器，使用 Tauri + React + PDF.js。以 MIT 许可证开源。
+
+[下载最新安装包](https://github.com/heyqingniany/SpecPilot/releases/latest) · [许可证](LICENSE)
 
 ## 已实现
 
@@ -30,7 +32,11 @@ AI 问答支持 DeepSeek、OpenAI、OpenRouter、硅基流动以及任意 OpenAI
 
 ## Windows 安装
 
-直接运行：
+从 [GitHub Releases](https://github.com/heyqingniany/SpecPilot/releases/latest) 下载 `SpecPilot_*_x64-setup.exe`。企业部署也可选择 MSI。
+
+当前安装包尚未代码签名，Windows SmartScreen 可能提示未知发布者。作为 MIT 开源项目，接下来会申请 [SignPath Foundation](https://signpath.org/) 免费代码签名。
+
+本地构建产物路径：
 
 `src-tauri/target/release/bundle/nsis/SpecPilot_0.7.3_x64-setup.exe`
 
@@ -53,3 +59,7 @@ npm run desktop:dev
 npm run build
 npm run desktop:build
 ```
+
+## 许可证
+
+本项目采用 [MIT](LICENSE) 许可证。欢迎提交 Issue 和 Pull Request。API Key 只保存在本机，请不要把密钥提交进仓库。

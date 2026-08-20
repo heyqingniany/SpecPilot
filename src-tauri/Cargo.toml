@@ -2,7 +2,8 @@
 name = "specpilot"
 version = "0.7.3"
 description = "AI-assisted technical PDF reader"
-authors = ["SpecPilot"]
+authors = ["heqingniany"]
+license = "MIT"
 edition = "2021"
 
 [lib]
